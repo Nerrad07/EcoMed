@@ -1,12 +1,17 @@
 # backend.py
 import io
-from typing import Dict
+import os
+import uuid
+from datetime import datetime
+from typing import Dict, Optional
 
 import numpy as np
 from PIL import Image
 import tensorflow as tf
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
 
 # === KONFIGURASI MODEL ===
 IMG_SIZE = (224, 224)
@@ -50,6 +55,17 @@ print("Model loaded.")
 # === FASTAPI APP ===
 app = FastAPI(title="EcoMed Medical Waste API")
 
+# Folder untuk menyimpan gambar hasil kiriman bot (sementara)
+IMAGES_DIR = "images"
+os.makedirs(IMAGES_DIR, exist_ok=True)
+
+# Mount folder gambar supaya bisa diakses dari web
+app.mount("/images", StaticFiles(directory=IMAGES_DIR), name="images")
+
+# Menyimpan prediksi terakhir (global in-memory)
+LAST_PREDICTION: Optional[Dict] = None
+
+
 # Biar bisa diakses dari web/JS (CORS)
 app.add_middleware(
     CORSMiddleware,
@@ -75,26 +91,65 @@ def health_check() -> Dict[str, str]:
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)) -> Dict:
     """
-    Terima 1 file gambar,
-    kembalikan label + confidence + semua probabilitas.
+    Terima 1 file gambar dari Telegram bot,
+    simpan hasil prediksi TERAKHIR di memori,
+    lalu kembalikan label + confidence + probs.
     """
+    global LAST_PREDICTION
+
     # Baca bytes gambar
     img_bytes = await file.read()
 
-    # Preprocess
+    # === 1) Preprocess untuk model ===
     x = preprocess_image_bytes(img_bytes)
 
-    # Prediksi
+    # === 2) Prediksi dengan model ===
     preds = MODEL.predict(x)[0]  # shape: (num_classes,)
     idx = int(np.argmax(preds))
     label = CLASS_NAMES[idx]
     confidence = float(preds[idx])
-
-    # Buat dictionary probabilitas per kelas (opsional, bisa dihapus kalau nggak perlu)
     probs = {CLASS_NAMES[i]: float(p) for i, p in enumerate(preds)}
 
+    # === 3) Simpan gambar ke disk supaya bisa ditampilkan di web ===
+    # (pakai UUID supaya unik)
+    image_id = str(uuid.uuid4())
+    image_filename = f"{image_id}.jpg"
+    image_path = os.path.join(IMAGES_DIR, image_filename)
+
+    # Simpan sebagai JPEG
+    image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    image.save(image_path, format="JPEG", quality=85)
+
+    image_url = f"/images/{image_filename}"
+
+    # === 4) Simpan prediksi terakhir di memori ===
+    LAST_PREDICTION = {
+        "id": image_id,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "label": label,
+        "confidence": confidence,
+        "probs": probs,
+        "image_url": image_url,
+    }
+
+    # === 5) Balas ke bot seperti biasa ===
     return {
         "label": label,
         "confidence": confidence,
         "probs": probs,
+        "image_url": image_url,
+    }
+
+@app.get("/latest_prediction")
+def latest_prediction() -> Dict:
+    """
+    Dikonsumsi oleh dashboard web.
+    Mengembalikan prediksi terakhir (jika ada).
+    """
+    if LAST_PREDICTION is None:
+        return {"has_prediction": False}
+
+    return {
+        "has_prediction": True,
+        **LAST_PREDICTION,
     }
